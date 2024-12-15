@@ -4,7 +4,8 @@ extern crate rand;
 extern crate phase2;
 
 // For randomness (during paramgen and proof generation)
-use rand::{thread_rng, Rng};
+extern crate rand_core;
+use rand_core::OsRng;
 
 // For benchmarking
 use std::time::{Duration, Instant};
@@ -12,13 +13,14 @@ use std::time::{Duration, Instant};
 // Bring in some tools for using pairing-friendly curves
 use pairing::{
     Engine,
-    Field,
+    group::ff::Field,
 };
 
 // We're going to use the BLS12-381 pairing-friendly elliptic curve.
-use pairing::bls12_381::{
-    Bls12
-};
+extern crate bls12_381;
+use bls12_381::{Bls12, Scalar};
+
+use std::ops::{AddAssign, MulAssign};
 
 // We'll use these interfaces to construct our circuit.
 use bellman::{
@@ -62,7 +64,7 @@ fn mimc<E: Engine>(
         let mut tmp1 = xl;
         tmp1.add_assign(&constants[i]);
         let mut tmp2 = tmp1;
-        tmp2.square();
+        tmp2 = tmp2.square();
         tmp2.mul_assign(&tmp1);
         tmp2.add_assign(&xr);
         xr = xl;
@@ -83,8 +85,8 @@ struct MiMCDemo<'a, E: Engine> {
 /// Our demo circuit implements this `Circuit` trait which
 /// is used during paramgen and proving in order to
 /// synthesize the constraint system.
-impl<'a, E: Engine> Circuit<E> for MiMCDemo<'a, E> {
-    fn synthesize<CS: ConstraintSystem<E>>(
+impl<'a, E: Engine> Circuit<E::Fr> for MiMCDemo<'a, E> {
+    fn synthesize<CS: ConstraintSystem<E::Fr>>(
         self,
         cs: &mut CS
     ) -> Result<(), SynthesisError>
@@ -108,12 +110,12 @@ impl<'a, E: Engine> Circuit<E> for MiMCDemo<'a, E> {
             let cs = &mut cs.namespace(|| format!("round {}", i));
 
             // tmp = (xL + Ci)^2
-            let mut tmp_value = xl_value.map(|mut e| {
+            let tmp_value = xl_value.map(|mut e| {
                 e.add_assign(&self.constants[i]);
-                e.square();
+                e = e.square();
                 e
             });
-            let mut tmp = cs.alloc(|| "tmp", || {
+            let tmp = cs.alloc(|| "tmp", || {
                 tmp_value.ok_or(SynthesisError::AssignmentMissing)
             })?;
 
@@ -127,14 +129,14 @@ impl<'a, E: Engine> Circuit<E> for MiMCDemo<'a, E> {
             // new_xL = xR + (xL + Ci)^3
             // new_xL = xR + tmp * (xL + Ci)
             // new_xL - xR = tmp * (xL + Ci)
-            let mut new_xl_value = xl_value.map(|mut e| {
+            let new_xl_value = xl_value.map(|mut e| {
                 e.add_assign(&self.constants[i]);
                 e.mul_assign(&tmp_value.unwrap());
                 e.add_assign(&xr_value.unwrap());
                 e
             });
 
-            let mut new_xl = if i == (MIMC_ROUNDS-1) {
+            let new_xl = if i == (MIMC_ROUNDS-1) {
                 // This is the last round, xL is our image and so
                 // we allocate a public input.
                 cs.alloc_input(|| "image", || {
@@ -167,12 +169,10 @@ impl<'a, E: Engine> Circuit<E> for MiMCDemo<'a, E> {
 }
 
 fn main() {
-    // This may not be cryptographically safe, use
-    // `OsRng` (for example) in production software.
-    let rng = &mut thread_rng();
+    let mut rng = OsRng.clone();
 
     // Generate the MiMC round constants
-    let constants = (0..MIMC_ROUNDS).map(|_| rng.gen()).collect::<Vec<_>>();
+    let constants = (0..MIMC_ROUNDS).map(|_| Scalar::random(&mut rng)).collect::<Vec<_>>();
 
     println!("Creating parameters...");
 
@@ -188,12 +188,12 @@ fn main() {
     };
 
     let old_params = params.clone();
-    params.contribute(rng);
+    params.contribute(&mut rng);
 
     let first_contrib = phase2::verify_contribution(&old_params, &params).expect("should verify");
 
     let old_params = params.clone();
-    params.contribute(rng);
+    params.contribute(&mut rng);
 
     let second_contrib = phase2::verify_contribution(&old_params, &params).expect("should verify");
 
@@ -224,8 +224,8 @@ fn main() {
 
     for _ in 0..SAMPLES {
         // Generate a random preimage and compute the image
-        let xl = rng.gen();
-        let xr = rng.gen();
+        let xl = Scalar::random(&mut rng);
+        let xr = Scalar::random(&mut rng);
         let image = mimc::<Bls12>(xl, xr, &constants);
 
         proof_vec.truncate(0);
@@ -234,14 +234,14 @@ fn main() {
         {
             // Create an instance of our circuit (with the
             // witness)
-            let c = MiMCDemo {
+            let c: MiMCDemo<'_, Bls12> = MiMCDemo {
                 xl: Some(xl),
                 xr: Some(xr),
                 constants: &constants
             };
 
             // Create a groth16 proof with our parameters.
-            let proof = create_random_proof(c, params, rng).unwrap();
+            let proof = create_random_proof(c, params, &mut rng).unwrap();
 
             proof.write(&mut proof_vec).unwrap();
         }
@@ -255,7 +255,7 @@ fn main() {
             &pvk,
             &proof,
             &[image]
-        ).unwrap());
+        ).is_ok());
         total_verifying += start.elapsed();
     }
     let proving_avg = total_proving / SAMPLES;

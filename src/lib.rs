@@ -218,32 +218,33 @@ use std::{
         Write,
         BufReader
     },
-    fs::{
-        File
+    ops::{
+        AddAssign,
+        Mul
     },
-    sync::{
-        Arc
-    }
+    fs::File,
+    sync::Arc
 };
 
 use pairing::{
+    group::{
+        ff::Field,
+        Curve,
+        Wnaf,
+        Group
+    },
     Engine,
-    PrimeField,
-    Field,
-    EncodedPoint,
-    CurveAffine,
-    CurveProjective,
-    Wnaf,
-    bls12_381::{
-        Bls12,
-        Fr,
-        G1,
-        G2,
-        G1Affine,
-        G1Uncompressed,
-        G2Affine,
-        G2Uncompressed
-    }
+    PairingCurveAffine
+};
+
+extern crate bls12_381;
+use bls12_381::{
+    Bls12,
+    G1Affine,
+    G1Projective,
+    G2Affine,
+    G2Projective,
+    Scalar
 };
 
 use bellman::{
@@ -261,10 +262,14 @@ use bellman::{
 };
 
 use rand::{
-    Rng,
-    Rand,
-    ChaChaRng,
-    SeedableRng
+    SeedableRng,
+    rngs::StdRng
+};
+
+extern crate rand_core;
+use rand_core::{
+    RngCore,
+    OsRng
 };
 
 /// This is our assembly structure that we'll use to synthesize the
@@ -281,7 +286,7 @@ struct KeypairAssembly<E: Engine> {
     ct_aux: Vec<Vec<(E::Fr, usize)>>
 }
 
-impl<E: Engine> ConstraintSystem<E> for KeypairAssembly<E> {
+impl<E: Engine> ConstraintSystem<E::Fr> for KeypairAssembly<E> {
     type Root = Self;
 
     fn alloc<F, A, AR>(
@@ -332,12 +337,12 @@ impl<E: Engine> ConstraintSystem<E> for KeypairAssembly<E> {
         c: LC
     )
         where A: FnOnce() -> AR, AR: Into<String>,
-              LA: FnOnce(LinearCombination<E>) -> LinearCombination<E>,
-              LB: FnOnce(LinearCombination<E>) -> LinearCombination<E>,
-              LC: FnOnce(LinearCombination<E>) -> LinearCombination<E>
+              LA: FnOnce(LinearCombination<E::Fr>) -> LinearCombination<E::Fr>,
+              LB: FnOnce(LinearCombination<E::Fr>) -> LinearCombination<E::Fr>,
+              LC: FnOnce(LinearCombination<E::Fr>) -> LinearCombination<E::Fr>
     {
         fn eval<E: Engine>(
-            l: LinearCombination<E>,
+            l: LinearCombination<E::Fr>,
             inputs: &mut [Vec<(E::Fr, usize)>],
             aux: &mut [Vec<(E::Fr, usize)>],
             this_constraint: usize
@@ -351,9 +356,9 @@ impl<E: Engine> ConstraintSystem<E> for KeypairAssembly<E> {
             }
         }
 
-        eval(a(LinearCombination::zero()), &mut self.at_inputs, &mut self.at_aux, self.num_constraints);
-        eval(b(LinearCombination::zero()), &mut self.bt_inputs, &mut self.bt_aux, self.num_constraints);
-        eval(c(LinearCombination::zero()), &mut self.ct_inputs, &mut self.ct_aux, self.num_constraints);
+        eval::<E>(a(LinearCombination::zero()), &mut self.at_inputs, &mut self.at_aux, self.num_constraints);
+        eval::<E>(b(LinearCombination::zero()), &mut self.bt_inputs, &mut self.bt_aux, self.num_constraints);
+        eval::<E>(c(LinearCombination::zero()), &mut self.ct_inputs, &mut self.ct_aux, self.num_constraints);
 
         self.num_constraints += 1;
     }
@@ -398,9 +403,9 @@ impl MPCParameters {
     pub fn new<C>(
         circuit: C,
     ) -> Result<MPCParameters, SynthesisError>
-        where C: Circuit<Bls12>
+        where C: Circuit<<Bls12 as Engine>::Fr>
     {
-        let mut assembly = KeypairAssembly {
+        let mut assembly: KeypairAssembly<Bls12> = KeypairAssembly {
             num_inputs: 0,
             num_aux: 0,
             num_constraints: 0,
@@ -413,7 +418,7 @@ impl MPCParameters {
         };
 
         // Allocate the "one" input variable
-        assembly.alloc_input(|| "", || Ok(Fr::one()))?;
+        assembly.alloc_input(|| "", || Ok(<Bls12 as Engine>::Fr::one()))?;
 
         // Synthesize the circuit.
         circuit.synthesize(&mut assembly)?;
@@ -450,30 +455,18 @@ impl MPCParameters {
         };
         let f = &mut BufReader::with_capacity(1024 * 1024, f);
 
-        let read_g1 = |reader: &mut BufReader<File>| -> io::Result<G1Affine> {
-            let mut repr = G1Uncompressed::empty();
-            reader.read_exact(repr.as_mut())?;
-
-            repr.into_affine_unchecked()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            .and_then(|e| if e.is_zero() {
-                Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity"))
-            } else {
-                Ok(e)
-            })
+        let read_g1 = |reader: &mut BufReader<File>| -> io::Result<<Bls12 as Engine>::G1Affine> {
+            let mut repr = [0; 96];
+            reader.read_exact(&mut repr)?;
+            let e = G1Affine::from_uncompressed_unchecked(&repr);
+            if bool::from(e.is_some()) { Ok(e.unwrap()) } else { Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity")) }
         };
 
-        let read_g2 = |reader: &mut BufReader<File>| -> io::Result<G2Affine> {
-            let mut repr = G2Uncompressed::empty();
-            reader.read_exact(repr.as_mut())?;
-
-            repr.into_affine_unchecked()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            .and_then(|e| if e.is_zero() {
-                Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity"))
-            } else {
-                Ok(e)
-            })
+        let read_g2 = |reader: &mut BufReader<File>| -> io::Result<<Bls12 as Engine>::G2Affine> {
+            let mut repr = [0; 192];
+            reader.read_exact(&mut repr)?;
+            let e = G2Affine::from_uncompressed_unchecked(&repr);
+            if bool::from(e.is_some()) { Ok(e.unwrap()) } else { Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity")) }
         };
 
         let alpha = read_g1(f)?;
@@ -513,11 +506,11 @@ impl MPCParameters {
             h.push(read_g1(f)?);
         }
 
-        let mut ic = vec![G1::zero(); assembly.num_inputs];
-        let mut l = vec![G1::zero(); assembly.num_aux];
-        let mut a_g1 = vec![G1::zero(); assembly.num_inputs + assembly.num_aux];
-        let mut b_g1 = vec![G1::zero(); assembly.num_inputs + assembly.num_aux];
-        let mut b_g2 = vec![G2::zero(); assembly.num_inputs + assembly.num_aux];
+        let mut ic = vec![G1Projective::identity(); assembly.num_inputs];
+        let mut l = vec![G1Projective::identity(); assembly.num_aux];
+        let mut a_g1 = vec![G1Projective::identity(); assembly.num_inputs + assembly.num_aux];
+        let mut b_g1 = vec![G1Projective::identity(); assembly.num_inputs + assembly.num_aux];
+        let mut b_g2 = vec![G2Projective::identity(); assembly.num_inputs + assembly.num_aux];
 
         fn eval(
             // Lagrange coefficients for tau
@@ -527,15 +520,15 @@ impl MPCParameters {
             beta_coeffs_g1: Arc<Vec<G1Affine>>,
 
             // QAP polynomials
-            at: &[Vec<(Fr, usize)>],
-            bt: &[Vec<(Fr, usize)>],
-            ct: &[Vec<(Fr, usize)>],
+            at: &[Vec<(<Bls12 as Engine>::Fr, usize)>],
+            bt: &[Vec<(<Bls12 as Engine>::Fr, usize)>],
+            ct: &[Vec<(<Bls12 as Engine>::Fr, usize)>],
 
             // Resulting evaluated QAP polynomials
-            a_g1: &mut [G1],
-            b_g1: &mut [G1],
-            b_g2: &mut [G2],
-            ext: &mut [G1],
+            a_g1: &mut [G1Projective],
+            b_g1: &mut [G1Projective],
+            b_g2: &mut [G2Projective],
+            ext: &mut [G1Projective],
 
             // Worker
             worker: &Worker
@@ -565,7 +558,7 @@ impl MPCParameters {
                     let alpha_coeffs_g1 = alpha_coeffs_g1.clone();
                     let beta_coeffs_g1 = beta_coeffs_g1.clone();
 
-                    scope.spawn(move || {
+                    scope.spawn(move |_| {
                         for ((((((a_g1, b_g1), b_g2), ext), at), bt), ct) in
                             a_g1.iter_mut()
                             .zip(b_g1.iter_mut())
@@ -592,10 +585,18 @@ impl MPCParameters {
                         }
 
                         // Batch normalize
-                        G1::batch_normalization(a_g1);
-                        G1::batch_normalization(b_g1);
-                        G2::batch_normalization(b_g2);
-                        G1::batch_normalization(ext);
+                        let mut a_g1_aff = vec![G1Affine::identity(); a_g1.len()];
+                        let mut b_g1_aff = vec![G1Affine::identity(); b_g1.len()];
+                        let mut b_g2_aff = vec![G2Affine::identity(); b_g2.len()];
+                        let mut ext_aff = vec![G1Affine::identity(); ext.len()];
+                        G1Projective::batch_normalize(a_g1, &mut a_g1_aff);
+                        G1Projective::batch_normalize(b_g1, &mut b_g1_aff);
+                        G2Projective::batch_normalize(b_g2, &mut b_g2_aff);
+                        G1Projective::batch_normalize(ext, &mut ext_aff);
+                        for (i, e) in a_g1_aff.iter().enumerate() { a_g1[i] = e.into() }
+                        for (i, e) in b_g1_aff.iter().enumerate() { b_g1[i] = e.into() }
+                        for (i, e) in b_g2_aff.iter().enumerate() { b_g2[i] = e.into() }
+                        for (i, e) in ext_aff.iter().enumerate() { ext[i] = e.into() }
                     });
                 }
             });
@@ -638,7 +639,7 @@ impl MPCParameters {
         // Don't allow any elements be unconstrained, so that
         // the L query is always fully dense.
         for e in l.iter() {
-            if e.is_zero() {
+            if bool::from(e.is_identity()) {
                 return Err(SynthesisError::UnconstrainedVariable);
             }
         }
@@ -647,21 +648,21 @@ impl MPCParameters {
             alpha_g1: alpha,
             beta_g1: beta_g1,
             beta_g2: beta_g2,
-            gamma_g2: G2Affine::one(),
-            delta_g1: G1Affine::one(),
-            delta_g2: G2Affine::one(),
-            ic: ic.into_iter().map(|e| e.into_affine()).collect()
+            gamma_g2: G2Affine::generator(),
+            delta_g1: G1Affine::generator(),
+            delta_g2: G2Affine::generator(),
+            ic: ic.into_iter().map(|e| e.to_affine()).collect()
         };
 
         let params = Parameters {
             vk: vk,
             h: Arc::new(h),
-            l: Arc::new(l.into_iter().map(|e| e.into_affine()).collect()),
+            l: Arc::new(l.into_iter().map(|e| e.to_affine()).collect()),
 
             // Filter points at infinity away from A/B queries
-            a: Arc::new(a_g1.into_iter().filter(|e| !e.is_zero()).map(|e| e.into_affine()).collect()),
-            b_g1: Arc::new(b_g1.into_iter().filter(|e| !e.is_zero()).map(|e| e.into_affine()).collect()),
-            b_g2: Arc::new(b_g2.into_iter().filter(|e| !e.is_zero()).map(|e| e.into_affine()).collect())
+            a: Arc::new(a_g1.into_iter().filter(|e| !bool::from(e.is_identity())).map(|e| e.to_affine()).collect()),
+            b_g1: Arc::new(b_g1.into_iter().filter(|e| !bool::from(e.is_identity())).map(|e| e.to_affine()).collect()),
+            b_g2: Arc::new(b_g2.into_iter().filter(|e| !bool::from(e.is_identity())).map(|e| e.to_affine()).collect())
         };
 
         let h = {
@@ -697,18 +698,18 @@ impl MPCParameters {
     /// sure their contribution is in the final parameters, by
     /// checking to see if it appears in the output of
     /// `MPCParameters::verify`.
-    pub fn contribute<R: Rng>(
+    pub fn contribute<R: RngCore>(
         &mut self,
-        rng: &mut R
+        mut rng: &mut R
     ) -> [u8; 64]
     {
         // Generate a keypair
-        let (pubkey, privkey) = keypair(rng, self);
+        let (pubkey, privkey) = keypair(&mut rng, self);
 
-        fn batch_exp<C: CurveAffine>(bases: &mut [C], coeff: C::Scalar) {
-            let coeff = coeff.into_repr();
+        fn batch_exp(bases: &mut [G1Affine], coeff: Scalar) {
+            //let coeff = coeff.to_repr();
 
-            let mut projective = vec![C::Projective::zero(); bases.len()];
+            let mut projective = vec![G1Projective::identity(); bases.len()];
             let cpus = num_cpus::get();
             let chunk_size = if bases.len() < cpus {
                 1
@@ -727,7 +728,7 @@ impl MPCParameters {
                         for (base, projective) in bases.iter_mut()
                                                        .zip(projective.iter_mut())
                         {
-                            *projective = wnaf.base(base.into_projective(), 1).scalar(coeff);
+                            *projective = wnaf.base(G1Projective::from(*base), 1).scalar(&coeff);
                         }
                     });
                 }
@@ -738,18 +739,20 @@ impl MPCParameters {
                 for projective in projective.chunks_mut(chunk_size)
                 {
                     scope.spawn(move || {
-                        C::Projective::batch_normalization(projective);
+                        let mut projective_aff = vec![G1Affine::identity(); projective.len()];
+                        G1Projective::batch_normalize(projective, &mut projective_aff);
+                        for (i, e) in projective_aff.iter().enumerate() { projective[i] = e.into() }
                     });
                 }
             });
 
             // Turn it all back into affine points
             for (projective, affine) in projective.iter().zip(bases.iter_mut()) {
-                *affine = projective.into_affine();
+                *affine = projective.into();
             }
         }
 
-        let delta_inv = privkey.delta.inverse().expect("nonzero");
+        let delta_inv = privkey.delta.invert().expect("nonzero");
         let mut l = (&self.params.l[..]).to_vec();
         let mut h = (&self.params.h[..]).to_vec();
         batch_exp(&mut l, delta_inv);
@@ -757,8 +760,8 @@ impl MPCParameters {
         self.params.l = Arc::new(l);
         self.params.h = Arc::new(h);
 
-        self.params.vk.delta_g1 = self.params.vk.delta_g1.mul(privkey.delta).into_affine();
-        self.params.vk.delta_g2 = self.params.vk.delta_g2.mul(privkey.delta).into_affine();
+        self.params.vk.delta_g1 = self.params.vk.delta_g1.mul(privkey.delta).into();
+        self.params.vk.delta_g2 = self.params.vk.delta_g2.mul(privkey.delta).into();
 
         self.contributions.push(pubkey.clone());
 
@@ -779,7 +782,7 @@ impl MPCParameters {
     /// contributors obtained when they ran
     /// `MPCParameters::contribute`, for ensuring that contributions
     /// exist in the final parameters.
-    pub fn verify<C: Circuit<Bls12>>(
+    pub fn verify<C: Circuit<<Bls12 as Engine>::Fr>>(
         &self,
         circuit: C
     ) -> Result<Vec<[u8; 64]>, ()>
@@ -833,13 +836,13 @@ impl MPCParameters {
         let mut sink = HashWriter::new(sink);
         sink.write_all(&initial_params.cs_hash[..]).unwrap();
 
-        let mut current_delta = G1Affine::one();
+        let mut current_delta = G1Affine::generator();
         let mut result = vec![];
 
         for pubkey in &self.contributions {
             let mut our_sink = sink.clone();
-            our_sink.write_all(pubkey.s.into_uncompressed().as_ref()).unwrap();
-            our_sink.write_all(pubkey.s_delta.into_uncompressed().as_ref()).unwrap();
+            our_sink.write_all(pubkey.s.to_uncompressed().as_ref()).unwrap();
+            our_sink.write_all(pubkey.s_delta.to_uncompressed().as_ref()).unwrap();
 
             pubkey.write(&mut sink).unwrap();
 
@@ -850,7 +853,7 @@ impl MPCParameters {
                 return Err(());
             }
 
-            let r = hash_to_g2(h.as_ref()).into_affine();
+            let r = hash_to_g2(h.as_ref()).into();
 
             // Check the signature of knowledge
             if !same_ratio((r, pubkey.r_delta), (pubkey.s, pubkey.s_delta)) {
@@ -885,8 +888,8 @@ impl MPCParameters {
 
         // Current parameters should have consistent delta in G2
         if !same_ratio(
-            (G1Affine::one(), current_delta),
-            (G2Affine::one(), self.params.vk.delta_g2)
+            (G1Affine::generator(), current_delta),
+            (G2Affine::generator(), self.params.vk.delta_g2)
         ) {
             return Err(());
         }
@@ -894,14 +897,14 @@ impl MPCParameters {
         // H and L queries should be updated with delta^-1
         if !same_ratio(
             merge_pairs(&initial_params.params.h, &self.params.h),
-            (self.params.vk.delta_g2, G2Affine::one()) // reversed for inverse
+            (self.params.vk.delta_g2, G2Affine::generator()) // reversed for inverse
         ) {
             return Err(());
         }
 
         if !same_ratio(
             merge_pairs(&initial_params.params.l, &self.params.l),
-            (self.params.vk.delta_g2, G2Affine::one()) // reversed for inverse
+            (self.params.vk.delta_g2, G2Affine::generator()) // reversed for inverse
         ) {
             return Err(());
         }
@@ -981,10 +984,10 @@ impl PublicKey {
         mut writer: W
     ) -> io::Result<()>
     {
-        writer.write_all(self.delta_after.into_uncompressed().as_ref())?;
-        writer.write_all(self.s.into_uncompressed().as_ref())?;
-        writer.write_all(self.s_delta.into_uncompressed().as_ref())?;
-        writer.write_all(self.r_delta.into_uncompressed().as_ref())?;
+        writer.write_all(self.delta_after.to_uncompressed().as_ref())?;
+        writer.write_all(self.s.to_uncompressed().as_ref())?;
+        writer.write_all(self.s_delta.to_uncompressed().as_ref())?;
+        writer.write_all(self.r_delta.to_uncompressed().as_ref())?;
         writer.write_all(&self.transcript)?;
 
         Ok(())
@@ -994,34 +997,34 @@ impl PublicKey {
         mut reader: R
     ) -> io::Result<PublicKey>
     {
-        let mut g1_repr = G1Uncompressed::empty();
-        let mut g2_repr = G2Uncompressed::empty();
+        let mut g1_repr = [0; 96];
+        let mut g2_repr = [0; 192];
 
         reader.read_exact(g1_repr.as_mut())?;
-        let delta_after = g1_repr.into_affine().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let delta_after = G1Affine::from_uncompressed_unchecked(&g1_repr).unwrap();
 
-        if delta_after.is_zero() {
+        if bool::from(delta_after.is_identity()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity"));
         }
 
         reader.read_exact(g1_repr.as_mut())?;
-        let s = g1_repr.into_affine().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let s = G1Affine::from_uncompressed_unchecked(&g1_repr).unwrap();
 
-        if s.is_zero() {
+        if bool::from(s.is_identity()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity"));
         }
 
         reader.read_exact(g1_repr.as_mut())?;
-        let s_delta = g1_repr.into_affine().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let s_delta = G1Affine::from_uncompressed_unchecked(&g1_repr).unwrap();
 
-        if s_delta.is_zero() {
+        if bool::from(s_delta.is_identity()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity"));
         }
 
         reader.read_exact(g2_repr.as_mut())?;
-        let r_delta = g2_repr.into_affine().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let r_delta = G2Affine::from_uncompressed_unchecked(&g2_repr).unwrap();
 
-        if r_delta.is_zero() {
+        if bool::from(r_delta.is_identity()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "point at infinity"));
         }
 
@@ -1113,8 +1116,8 @@ pub fn verify_contribution(
     }
 
     let pubkey = after.contributions.last().unwrap();
-    sink.write_all(pubkey.s.into_uncompressed().as_ref()).unwrap();
-    sink.write_all(pubkey.s_delta.into_uncompressed().as_ref()).unwrap();
+    sink.write_all(pubkey.s.to_uncompressed().as_ref()).unwrap();
+    sink.write_all(pubkey.s_delta.to_uncompressed().as_ref()).unwrap();
 
     let h = sink.into_hash();
 
@@ -1123,7 +1126,7 @@ pub fn verify_contribution(
         return Err(());
     }
 
-    let r = hash_to_g2(h.as_ref()).into_affine();
+    let r = hash_to_g2(h.as_ref()).into();
 
     // Check the signature of knowledge
     if !same_ratio((r, pubkey.r_delta), (pubkey.s, pubkey.s_delta)) {
@@ -1145,8 +1148,8 @@ pub fn verify_contribution(
 
     // Current parameters should have consistent delta in G2
     if !same_ratio(
-        (G1Affine::one(), pubkey.delta_after),
-        (G2Affine::one(), after.params.vk.delta_g2)
+        (G1Affine::generator(), pubkey.delta_after),
+        (G2Affine::generator(), after.params.vk.delta_g2)
     ) {
         return Err(());
     }
@@ -1177,7 +1180,7 @@ pub fn verify_contribution(
 }
 
 /// Checks if pairs have the same ratio.
-fn same_ratio<G1: CurveAffine>(
+fn same_ratio<G1: PairingCurveAffine>(
     g1: (G1, G1),
     g2: (G1::Pair, G1::Pair)
 ) -> bool
@@ -1198,17 +1201,16 @@ fn same_ratio<G1: CurveAffine>(
 /// e(g, (as)*r1 + (bs)*r2 + (cs)*r3) = e(g^s, a*r1 + b*r2 + c*r3)
 ///
 /// ... with high probability.
-fn merge_pairs<G: CurveAffine>(v1: &[G], v2: &[G]) -> (G, G)
+fn merge_pairs(v1: &[G1Affine], v2: &[G1Affine]) -> (G1Affine, G1Affine)
 {
     use std::sync::{Arc, Mutex};
-    use rand::{thread_rng};
 
     assert_eq!(v1.len(), v2.len());
 
     let chunk = (v1.len() / num_cpus::get()) + 1;
 
-    let s = Arc::new(Mutex::new(G::Projective::zero()));
-    let sx = Arc::new(Mutex::new(G::Projective::zero()));
+    let s = Arc::new(Mutex::new(G1Projective::identity()));
+    let sx = Arc::new(Mutex::new(G1Projective::identity()));
 
     crossbeam::scope(|scope| {
         for (v1, v2) in v1.chunks(chunk).zip(v2.chunks(chunk)) {
@@ -1218,17 +1220,17 @@ fn merge_pairs<G: CurveAffine>(v1: &[G], v2: &[G]) -> (G, G)
             scope.spawn(move || {
                 // We do not need to be overly cautious of the RNG
                 // used for this check.
-                let rng = &mut thread_rng();
+                let mut rng = OsRng.clone();
 
                 let mut wnaf = Wnaf::new();
-                let mut local_s = G::Projective::zero();
-                let mut local_sx = G::Projective::zero();
+                let mut local_s = G1Projective::identity();
+                let mut local_sx = G1Projective::identity();
 
                 for (v1, v2) in v1.iter().zip(v2.iter()) {
-                    let rho = G::Scalar::rand(rng);
-                    let mut wnaf = wnaf.scalar(rho.into_repr());
-                    let v1 = wnaf.base(v1.into_projective());
-                    let v2 = wnaf.base(v2.into_projective());
+                    let rho = Scalar::random(&mut rng);
+                    let mut wnaf = wnaf.scalar(&rho);
+                    let v1: G1Projective = wnaf.base(v1.into());
+                    let v2: G1Projective = wnaf.base(v2.into());
 
                     local_s.add_assign(&v1);
                     local_sx.add_assign(&v2);
@@ -1240,8 +1242,8 @@ fn merge_pairs<G: CurveAffine>(v1: &[G], v2: &[G]) -> (G, G)
         }
     });
 
-    let s = s.lock().unwrap().into_affine();
-    let sx = sx.lock().unwrap().into_affine();
+    let s = (*s.lock().unwrap()).into();
+    let sx = (*sx.lock().unwrap()).into();
 
     (s, sx)
 }
@@ -1249,23 +1251,23 @@ fn merge_pairs<G: CurveAffine>(v1: &[G], v2: &[G]) -> (G, G)
 /// This needs to be destroyed by at least one participant
 /// for the final parameters to be secure.
 struct PrivateKey {
-    delta: Fr
+    delta: Scalar
 }
 
 /// Compute a keypair, given the current parameters. Keypairs
 /// cannot be reused for multiple contributions or contributions
 /// in different parameters.
-fn keypair<R: Rng>(
-    rng: &mut R,
+fn keypair<R: RngCore>(
+    mut rng: &mut R,
     current: &MPCParameters,
 ) -> (PublicKey, PrivateKey)
 {
     // Sample random delta
-    let delta: Fr = rng.gen();
+    let delta = Scalar::random(&mut rng);
 
     // Compute delta s-pair in G1
-    let s = G1::rand(rng).into_affine();
-    let s_delta = s.mul(delta).into_affine();
+    let s: G1Affine = G1Projective::random(&mut rng).into();
+    let s_delta: G1Affine = s.mul(delta).into();
 
     // H(cs_hash | <previous pubkeys> | s | s_delta)
     let h = {
@@ -1276,8 +1278,8 @@ fn keypair<R: Rng>(
         for pubkey in &current.contributions {
             pubkey.write(&mut sink).unwrap();
         }
-        sink.write_all(s.into_uncompressed().as_ref()).unwrap();
-        sink.write_all(s_delta.into_uncompressed().as_ref()).unwrap();
+        sink.write_all(s.to_uncompressed().as_ref()).unwrap();
+        sink.write_all(s_delta.to_uncompressed().as_ref()).unwrap();
 
         sink.into_hash()
     };
@@ -1288,12 +1290,12 @@ fn keypair<R: Rng>(
     transcript.copy_from_slice(h.as_ref());
 
     // Compute delta s-pair in G2
-    let r = hash_to_g2(h.as_ref()).into_affine();
-    let r_delta = r.mul(delta).into_affine();
+    let r: G2Affine = hash_to_g2(h.as_ref()).into();
+    let r_delta = r.mul(delta).into();
 
     (
         PublicKey {
-            delta_after: current.params.vk.delta_g1.mul(delta).into_affine(),
+            delta_after: current.params.vk.delta_g1.mul(delta).into(),
             s: s,
             s_delta: s_delta,
             r_delta: r_delta,
@@ -1305,19 +1307,16 @@ fn keypair<R: Rng>(
     )
 }
 
-/// Hashes to G2 using the first 32 bytes of `digest`. Panics if `digest` is less
-/// than 32 bytes.
-fn hash_to_g2(mut digest: &[u8]) -> G2
+/// Hashes to G2 using the first 8 bytes of `digest`. Panics if `digest` is less
+/// than 8 bytes.
+fn hash_to_g2(mut digest: &[u8]) -> G2Projective
 {
-    assert!(digest.len() >= 32);
+    assert!(digest.len() >= 8);
 
-    let mut seed = Vec::with_capacity(8);
+    let seed = digest.read_u64::<BigEndian>().expect("assertion above guarantees this to work");
 
-    for _ in 0..8 {
-        seed.push(digest.read_u32::<BigEndian>().expect("assertion above guarantees this to work"));
-    }
-
-    ChaChaRng::from_seed(&seed).gen()
+    let mut rng = StdRng::seed_from_u64(seed);
+    G2Projective::random(&mut rng)
 }
 
 /// Abstraction over a writer which hashes the data being written.
