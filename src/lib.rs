@@ -212,18 +212,12 @@ use byteorder::{
 };
 
 use std::{
-    io::{
-        self,
-        Read,
-        Write,
-        BufReader
-    },
-    ops::{
+    convert::TryInto, fs::File, io::{
+        self, BufReader, Read, Write
+    }, ops::{
         AddAssign,
         Mul
-    },
-    fs::File,
-    sync::Arc
+    }, sync::Arc
 };
 
 use pairing::{
@@ -1307,15 +1301,13 @@ fn keypair<R: RngCore>(
     )
 }
 
-/// Hashes to G2 using the first 8 bytes of `digest`. Panics if `digest` is less
-/// than 8 bytes.
-fn hash_to_g2(mut digest: &[u8]) -> G2Projective
+/// Hashes to G2 using the first 32 bytes of `digest`. Panics if `digest` is less
+/// than 32 bytes.
+fn hash_to_g2(digest: &[u8]) -> G2Projective
 {
-    assert!(digest.len() >= 8);
-
-    let seed = digest.read_u64::<BigEndian>().expect("assertion above guarantees this to work");
-
-    let mut rng = StdRng::seed_from_u64(seed);
+    assert!(digest.len() >= 32);
+    let seed = digest[0..32].try_into().expect("assertion above guarantees this to work");
+    let mut rng = StdRng::from_seed(seed);
     G2Projective::random(&mut rng)
 }
 
